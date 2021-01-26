@@ -1,4 +1,4 @@
-// Copyright 2018-2020 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
 
 use crate::ast;
 use crate::ast::parse;
@@ -13,7 +13,6 @@ use crate::info::ModuleGraphInfo;
 use crate::info::ModuleInfo;
 use crate::info::ModuleInfoMap;
 use crate::info::ModuleInfoMapItem;
-use crate::js;
 use crate::lockfile::Lockfile;
 use crate::media_type::MediaType;
 use crate::specifier_handler::CachedModule;
@@ -26,10 +25,11 @@ use crate::tsc;
 use crate::tsc_config::IgnoredCompilerOptions;
 use crate::tsc_config::TsConfig;
 use crate::version;
-use crate::AnyError;
+use deno_core::error::AnyError;
 
 use deno_core::error::anyhow;
 use deno_core::error::custom_error;
+use deno_core::error::get_custom_error_class;
 use deno_core::error::Context;
 use deno_core::futures::stream::FuturesUnordered;
 use deno_core::futures::stream::StreamExt;
@@ -849,23 +849,20 @@ impl Graph {
       info!("{} {}", colors::green("Check"), specifier);
     }
 
-    let root_names = self.get_root_names(!config.get_check_js());
+    let root_names = self.get_root_names(!config.get_check_js())?;
     let maybe_tsbuildinfo = self.maybe_tsbuildinfo.clone();
     let hash_data =
       vec![config.as_bytes(), version::deno().as_bytes().to_owned()];
     let graph = Arc::new(Mutex::new(self));
 
-    let response = tsc::exec(
-      js::compiler_isolate_init(),
-      tsc::Request {
-        config: config.clone(),
-        debug: options.debug,
-        graph: graph.clone(),
-        hash_data,
-        maybe_tsbuildinfo,
-        root_names,
-      },
-    )?;
+    let response = tsc::exec(tsc::Request {
+      config: config.clone(),
+      debug: options.debug,
+      graph: graph.clone(),
+      hash_data,
+      maybe_tsbuildinfo,
+      root_names,
+    })?;
 
     let mut graph = graph.lock().unwrap();
     graph.maybe_tsbuildinfo = response.maybe_tsbuildinfo;
@@ -979,21 +976,18 @@ impl Graph {
 
     let mut emitted_files = HashMap::new();
     if options.check {
-      let root_names = self.get_root_names(!config.get_check_js());
+      let root_names = self.get_root_names(!config.get_check_js())?;
       let hash_data =
         vec![config.as_bytes(), version::deno().as_bytes().to_owned()];
       let graph = Arc::new(Mutex::new(self));
-      let response = tsc::exec(
-        js::compiler_isolate_init(),
-        tsc::Request {
-          config: config.clone(),
-          debug: options.debug,
-          graph: graph.clone(),
-          hash_data,
-          maybe_tsbuildinfo: None,
-          root_names,
-        },
-      )?;
+      let response = tsc::exec(tsc::Request {
+        config: config.clone(),
+        debug: options.debug,
+        graph: graph.clone(),
+        hash_data,
+        maybe_tsbuildinfo: None,
+        root_names,
+      })?;
 
       let graph = graph.lock().unwrap();
       match options.bundle_type {
@@ -1336,7 +1330,7 @@ impl Graph {
   fn get_root_names(
     &self,
     include_emittable: bool,
-  ) -> Vec<(ModuleSpecifier, MediaType)> {
+  ) -> Result<Vec<(ModuleSpecifier, MediaType)>, AnyError> {
     let root_names: Vec<ModuleSpecifier> = if include_emittable {
       // in situations where there is `allowJs` with tsc, but not `checkJs`,
       // then tsc will not parse the whole module graph, meaning that any
@@ -1362,32 +1356,38 @@ impl Graph {
     } else {
       self.roots.clone()
     };
-    root_names
-      .iter()
-      .map(|ms| {
-        // if the root module has a types specifier, we should be sending that
-        // to tsc instead of the original specifier
-        let specifier = self.resolve_specifier(ms);
-        let module =
-          if let ModuleSlot::Module(module) = self.get_module(specifier) {
-            module
+    let mut root_types = vec![];
+    for ms in root_names {
+      // if the root module has a types specifier, we should be sending that
+      // to tsc instead of the original specifier
+      let specifier = self.resolve_specifier(&ms);
+      let module = match self.get_module(specifier) {
+        ModuleSlot::Module(module) => module,
+        ModuleSlot::Err(error) => {
+          // It would be great if we could just clone the error here...
+          if let Some(class) = get_custom_error_class(error) {
+            return Err(custom_error(class, error.to_string()));
           } else {
-            panic!("missing module");
-          };
-        let specifier = if let Some((_, types_specifier)) = &module.maybe_types
-        {
-          self.resolve_specifier(types_specifier)
-        } else {
-          specifier
-        };
-        (
-          // root modules can be redirects, so before we pass it to tsc we need
-          // to resolve the redirect
-          specifier.clone(),
-          self.get_media_type(specifier).unwrap(),
-        )
-      })
-      .collect()
+            panic!("unsupported ModuleSlot error");
+          }
+        }
+        _ => {
+          panic!("missing module");
+        }
+      };
+      let specifier = if let Some((_, types_specifier)) = &module.maybe_types {
+        self.resolve_specifier(types_specifier)
+      } else {
+        specifier
+      };
+      root_types.push((
+        // root modules can be redirects, so before we pass it to tsc we need
+        // to resolve the redirect
+        specifier.clone(),
+        self.get_media_type(specifier).unwrap(),
+      ));
+    }
+    Ok(root_types)
   }
 
   /// Get the source for a given module specifier.  If the module is not part
@@ -2300,10 +2300,11 @@ pub mod tests {
       .expect("should have checked");
     assert!(result_info.maybe_ignored_options.is_none());
     assert!(result_info.diagnostics.is_empty());
-    let h = handler.lock().unwrap();
-    assert_eq!(h.version_calls.len(), 2);
-    let ver0 = h.version_calls[0].1.clone();
-    let ver1 = h.version_calls[1].1.clone();
+    let (ver0, ver1) = {
+      let h = handler.lock().unwrap();
+      assert_eq!(h.version_calls.len(), 2);
+      (h.version_calls[0].1.clone(), h.version_calls[1].1.clone())
+    };
 
     // let's do it all over again to ensure that the versions are determinstic
     let (graph, handler) = setup(specifier).await;
